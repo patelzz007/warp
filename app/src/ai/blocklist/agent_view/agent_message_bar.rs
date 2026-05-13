@@ -51,6 +51,8 @@ use crate::terminal::input::suggestions_mode_model::{
 use crate::terminal::input::{HandoffComposeState, InputAction, SET_INPUT_MODE_AGENT_ACTION_NAME};
 use crate::terminal::model::TerminalModel;
 use crate::terminal::view::TerminalAction;
+#[cfg(not(target_family = "wasm"))]
+use crate::workspace::WorkspaceAction;
 use crate::ui_components::blended_colors;
 use crate::util::bindings::keybinding_name_to_keystroke;
 use crate::workspace::tab_settings::{TabSettings, TabSettingsChangedEvent};
@@ -630,6 +632,29 @@ impl MessageProvider<AgentMessageArgs<'_>> for ZeroStateMessageProducer {
                     mouse_states.toggle_conversation_menu.clone(),
                 ));
             }
+        }
+
+        // Code review only works locally.
+        #[cfg(not(target_family = "wasm"))]
+        if !is_cloud_agent
+            && !AISettings::as_ref(app).is_cloud_handoff_enabled(app)
+            && *TabSettings::as_ref(app).show_code_review_button
+        {
+            let code_review_keystroke = if OperatingSystem::get().is_mac() {
+                Keystroke::parse("cmd-shift-+").expect("keystroke should parse")
+            } else {
+                Keystroke::parse("ctrl-shift-+").expect("keystroke should parse")
+            };
+            items.push(MessageItem::clickable(
+                vec![
+                    MessageItem::keystroke(code_review_keystroke),
+                    MessageItem::text("for code review"),
+                ],
+                |ctx| {
+                    ctx.dispatch_typed_action(WorkspaceAction::ToggleRightPanel);
+                },
+                mouse_states.toggle_code_review.clone(),
+            ));
         }
 
         if has_plan {
