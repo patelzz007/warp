@@ -48,7 +48,9 @@ use crate::ui_components::icon_with_status::{
     self, render_icon_with_status, IconWithStatusVariant,
 };
 use crate::ui_components::icons::Icon;
-use crate::workspace::{WorkspaceAction, WorkspaceRegistry};
+use crate::workspace::WorkspaceAction;
+#[cfg(not(target_family = "wasm"))]
+use crate::workspace::WorkspaceRegistry;
 use warp_core::ui::theme::color::internal_colors;
 use warpui::EntityId;
 
@@ -145,7 +147,7 @@ fn collect_descendant_conversation_ids_in_spawn_order(
 }
 
 /// What kind of pill we are rendering, which determines click behavior.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum PillKind {
     Orchestrator,
     Child,
@@ -1351,7 +1353,16 @@ fn render_pill(
     let is_selected = spec.is_selected;
     let pin_state = spec.pin_state;
     let is_pinned = matches!(pin_state, PillPinState::PinnedInOtherPane);
+    // The 3-dot overflow menu offers pane-management actions (open in new
+    // pane / tab, focus pane) that don't apply to the single-pane web
+    // viewer. Suppress the dots on WASM so the menu can never open.
+    #[cfg(not(target_family = "wasm"))]
     let show_overflow_button = matches!(kind, PillKind::Child);
+    #[cfg(target_family = "wasm")]
+    let show_overflow_button = {
+        let _ = kind;
+        false
+    };
     // `spec` is owned by value, so we can move `label` directly into the
     // build closure below without cloning.
     let label = spec.label;
@@ -1548,6 +1559,9 @@ fn render_pill(
     })
     .on_click(move |ctx, app, _| {
         if is_selected {
+            log::info!(
+                "[orch-pill] click ignored (already selected): conv={conversation_id:?} kind={kind:?}"
+            );
             return;
         }
         // Single source of truth: if the conversation is currently owned
@@ -1562,24 +1576,69 @@ fn render_pill(
         // `ViewContext<Self>`, which reliably reaches the workspace.
         let is_open_elsewhere =
             is_conversation_open_in_other_visible_view(conversation_id, self_terminal_view_id, app);
+
+        // Collect diagnostic flags up front so we log a single line covering
+        // both the orchestrator-side decision and what `view.rs` will see.
+        let history_ref = BlocklistAIHistoryModel::as_ref(app);
+        let conv = history_ref.conversation(&conversation_id);
+        let child_flag = conv
+            .map(|c| c.is_viewing_shared_session())
+            .unwrap_or(false);
+        let parent_conv_id = conv.and_then(|c| c.parent_conversation_id());
+        let parent_flag = parent_conv_id
+            .and_then(|pid| history_ref.conversation(&pid))
+            .map(|p| p.is_viewing_shared_session())
+            .unwrap_or(false);
+        let owner_view_id =
+            history_ref.terminal_view_id_for_conversation(&conversation_id);
+        log::info!(
+            "[orch-pill] click: conv={conversation_id:?} kind={kind:?} \
+             self_view_id={self_terminal_view_id:?} owner_view_id={owner_view_id:?} \
+             is_open_elsewhere={is_open_elsewhere} child_flag={child_flag} \
+             parent_conv={parent_conv_id:?} parent_flag={parent_flag}"
+        );
+
         if is_open_elsewhere {
+            log::info!(
+                "[orch-pill] dispatching FocusOpenedConversation: conv={conversation_id:?}"
+            );
             ctx.dispatch_typed_action(OrchestrationPillBarAction::FocusOpenedConversation(
                 conversation_id,
             ));
             return;
         }
-        // Child pills should reveal the existing child pane/session, not
+        // Child pills usually reveal the existing child pane/session, not
         // switch the current pane in place. The hidden child pane owns the
         // live harness/ambient session and associated view-scoped models; if
         // we merely re-enter the child conversation in the current pane, the
         // actual running session stays attached to the hidden pane and the
-        // user sees an empty child view. The orchestrator pill still switches
-        // the current pane back to the parent conversation.
+        // user sees an empty child view.
+        //
+        // Shared-session viewer children are the exception: the viewer model
+        // owns one pane and lazily joins the selected child's shared session
+        // into that same view, so materializing a normal hidden child pane
+        // would show an empty clone while the transcript events route to the
+        // original shared-session view. Detect this case by checking either
+        // the child conversation or its parent (the orchestrator) for the
+        // `is_viewing_shared_session` flag; the orchestrator's flag is the
+        // most reliable signal because it's set unconditionally in
+        // `BlocklistAIController::on_shared_init` while the child's flag
+        // depends on `OrchestrationViewerModel` having already discovered
+        // and registered the child.
         //
         // We keep the visible-owner fast path above so a child that's already
         // open in another visible pane/tab still focuses that existing
         // destination rather than trying to reveal the hidden bootstrap pane.
-        let action = navigation_action_for_pill(kind, conversation_id);
+        let treat_as_shared_child =
+            matches!(kind, PillKind::Child) && (child_flag || parent_flag);
+        let action = if treat_as_shared_child {
+            TerminalAction::SwitchAgentViewToConversation { conversation_id }
+        } else {
+            navigation_action_for_pill(kind, conversation_id)
+        };
+        log::info!(
+            "[orch-pill] dispatching action: conv={conversation_id:?} treat_as_shared_child={treat_as_shared_child} action={action:?}"
+        );
         ctx.dispatch_typed_action(
             PaneHeaderAction::<TerminalAction, TerminalAction>::CustomAction(action),
         );
@@ -1788,6 +1847,11 @@ const CRUMB_HORIZONTAL_PADDING: f32 = 6.;
 /// `Workspace::tab_views()` and consulting `PaneGroup::visible_pane_ids()`
 /// (which excludes hidden-for-child-agent / hidden-for-close / etc.
 /// panes) confirms the owner is a pane the user can actually navigate to.
+///
+/// On WASM the viewer is single-pane and the `WorkspaceRegistry` /
+/// `PaneGroup` APIs used here are not available, so this always returns
+/// `false`.
+#[cfg(not(target_family = "wasm"))]
 fn is_conversation_open_in_other_visible_view(
     conversation_id: AIConversationId,
     self_terminal_view_id: EntityId,
@@ -1818,11 +1882,28 @@ fn is_conversation_open_in_other_visible_view(
     false
 }
 
+/// WASM stub for [`is_conversation_open_in_other_visible_view`]: the web
+/// viewer is single-pane and has no `WorkspaceRegistry` / `PaneGroup` to
+/// walk, so it can never own a pill's conversation in some other pane.
+#[cfg(target_family = "wasm")]
+fn is_conversation_open_in_other_visible_view(
+    _conversation_id: AIConversationId,
+    _self_terminal_view_id: EntityId,
+    _app: &AppContext,
+) -> bool {
+    false
+}
+
 /// Walks every visible terminal pane across every workspace/tab and
 /// returns the `EntityId` of the `PaneGroup` that contains the given
 /// `terminal_view_id`, if any. Used by the pill bar to decide between
 /// the same-pane-group focus path (`RevealChildAgent`) and the
 /// cross-pane-group path (`FocusTerminalViewInWorkspace`).
+///
+/// On WASM the viewer is single-pane and the `WorkspaceRegistry` /
+/// `PaneGroup` APIs used here are not available, so this always returns
+/// `None`.
+#[cfg(not(target_family = "wasm"))]
 fn pane_group_id_containing_terminal_view(
     terminal_view_id: EntityId,
     app: &AppContext,
@@ -1841,6 +1922,16 @@ fn pane_group_id_containing_terminal_view(
             }
         }
     }
+    None
+}
+
+/// WASM stub for [`pane_group_id_containing_terminal_view`]: the web
+/// viewer is single-pane and has no `PaneGroup` registry to walk.
+#[cfg(target_family = "wasm")]
+fn pane_group_id_containing_terminal_view(
+    _terminal_view_id: EntityId,
+    _app: &AppContext,
+) -> Option<EntityId> {
     None
 }
 
