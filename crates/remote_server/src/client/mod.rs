@@ -20,8 +20,9 @@ use crate::proto::{
     FragmentMetadataLookupErrorCode, GetFragmentMetadataFromHash,
     GetFragmentMetadataFromHashSuccess, IndexCodebase, Initialize, InitializeResponse,
     LoadRepoMetadataDirectoryResponse, NavigatedToDirectoryResponse, OpenBuffer,
-    OpenBufferResponse, ReadFileContextRequest, ReadFileContextResponse, RunCommandRequest,
-    RunCommandResponse, SaveBuffer, ServerMessage, SessionBootstrapped, TextEdit, WriteFile,
+    OpenBufferResponse, ReadFileContextRequest, ReadFileContextResponse, ResyncCodebase,
+    RunCommandRequest, RunCommandResponse, SaveBuffer, ServerMessage, SessionBootstrapped,
+    TextEdit, WriteFile,
 };
 
 use crate::protocol::{self, ProtocolError, RequestId};
@@ -257,7 +258,6 @@ impl RemoteServerClient {
             }
         }
     }
-
     /// Sends an `IndexCodebase` request and awaits the initial status update.
     pub async fn index_codebase(
         &self,
@@ -279,14 +279,44 @@ impl RemoteServerClient {
         );
 
         let response = self.send_request(request_id, msg).await?;
+        Self::codebase_index_status_from_response("IndexCodebase", response)
+    }
 
+    /// Sends a `ResyncCodebase` request and awaits the resulting status update.
+    pub async fn resync_codebase(
+        &self,
+        repo_path: String,
+        auth_token: String,
+    ) -> Result<RemoteCodebaseIndexStatus, ClientError> {
+        let request_id = RequestId::new();
+        let repo_path_for_log = repo_path.clone();
+        let msg = ClientMessage {
+            request_id: request_id.to_string(),
+            message: Some(client_message::Message::ResyncCodebase(ResyncCodebase {
+                repo_path,
+                auth_token,
+            })),
+        };
+        log::info!(
+            "[Remote codebase indexing] Client sending ResyncCodebase: request_id={request_id} \
+             repo_path={repo_path_for_log}"
+        );
+
+        let response = self.send_request(request_id, msg).await?;
+        Self::codebase_index_status_from_response("ResyncCodebase", response)
+    }
+
+    fn codebase_index_status_from_response(
+        operation: &str,
+        response: ServerMessage,
+    ) -> Result<RemoteCodebaseIndexStatus, ClientError> {
         match response.message {
             Some(server_message::Message::CodebaseIndexStatusUpdated(update)) => {
                 let status =
                     crate::codebase_index_proto::proto_to_codebase_index_status_updated(&update)
                         .ok_or(ClientError::UnexpectedResponse)?;
                 log::info!(
-                    "[Remote codebase indexing] Client received IndexCodebase response: \
+                    "[Remote codebase indexing] Client received {operation} response: \
                      repo_path={} state={:?}",
                     status.repo_path,
                     status.state
@@ -294,7 +324,7 @@ impl RemoteServerClient {
                 Ok(status)
             }
             other => {
-                log::error!("Unexpected response variant for IndexCodebase: {other:?}");
+                log::error!("Unexpected response variant for {operation}: {other:?}");
                 Err(ClientError::UnexpectedResponse)
             }
         }
@@ -324,24 +354,7 @@ impl RemoteServerClient {
 
         let response = self.send_request(request_id, msg).await?;
 
-        match response.message {
-            Some(server_message::Message::CodebaseIndexStatusUpdated(update)) => {
-                let status =
-                    crate::codebase_index_proto::proto_to_codebase_index_status_updated(&update)
-                        .ok_or(ClientError::UnexpectedResponse)?;
-                log::info!(
-                    "[Remote codebase indexing] Client received DropCodebaseIndex response: \
-                     repo_path={} state={:?}",
-                    status.repo_path,
-                    status.state
-                );
-                Ok(status)
-            }
-            other => {
-                log::error!("Unexpected response variant for DropCodebaseIndex: {other:?}");
-                Err(ClientError::UnexpectedResponse)
-            }
-        }
+        Self::codebase_index_status_from_response("DropCodebaseIndex", response)
     }
 
     /// Maps backend content hashes to server-local fragment metadata for a synced repo snapshot.
